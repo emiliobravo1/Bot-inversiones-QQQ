@@ -26,9 +26,3 @@ Si deseas clonar y ejecutar este bot en tu entorno local, necesitarás:
 2. Un token de la API de Telegram (obtenido a través de [@BotFather](https://t.me/botfather)).
 3. Tu ID de chat de Telegram (obtenido a través de bots como [@userinfobot](https://t.me/userinfobot)).
 
-## 💻 Instalación y Uso Local
-
-1. **Clona este repositorio:**
-   ```bash
-   git clone [https://github.com/TU_USUARIO/TU_REPOSITORIO.git](https://github.com/TU_USUARIO/TU_REPOSITORIO.git)
-   cd TU_REPOSITORIO

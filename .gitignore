@@ -1,0 +1,5 @@
+# Variables de entorno (¡Contraseñas!)
+.env
+
+# Entorno virtual de Python
+.venv/

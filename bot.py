@@ -51,9 +51,19 @@ def analizar_sentimiento_noticias(ticker="QQQ"):
     return estado_noticias, promedio
 
 def enviar_mensaje_telegram(mensaje):
+    print(f"Intentando enviar mensaje a Chat ID: {CHAT_ID} usando Token: {TOKEN[:5]}...") # Imprime inicio del token para seguridad
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}
-    requests.post(url, json=payload)
+    
+    # Capturamos la respuesta de Telegram
+    respuesta = requests.post(url, json=payload)
+    
+    # Imprimimos lo que Telegram nos dice
+    print("Código de respuesta de Telegram:", respuesta.status_code)
+    print("Detalle:", respuesta.text)
+    
+    # Forzamos un error si Telegram rechaza el mensaje
+    respuesta.raise_for_status()
 
 def analizar_etf(ticker="QQQ"):
     print(f"Evaluando {ticker} y leyendo noticias...")

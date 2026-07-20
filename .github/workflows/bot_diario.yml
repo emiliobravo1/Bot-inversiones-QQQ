@@ -23,7 +23,7 @@ jobs:
       - name: Instalar librerías
         run: |
           python -m pip install --upgrade pip
-          pip install yfinance pandas vaderSentiment requests
+          pip install yfinance pandas vaderSentiment requests python-dotenv
           # Si tienes un archivo requirements.txt, borra la línea de arriba y usa esta:
           # pip install -r requirements.txt
 

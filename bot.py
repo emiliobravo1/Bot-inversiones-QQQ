@@ -14,8 +14,9 @@ def calcular_rsi(datos, ventana=14):
     delta = datos['Close'].diff()
     ganancias = delta.where(delta > 0, 0)
     perdidas = -delta.where(delta < 0, 0)
-    media_ganancias = ganancias.rolling(window=ventana, min_periods=1).mean()
-    media_perdidas = perdidas.rolling(window=ventana, min_periods=1).mean()
+    media_ganancias = ganancias.ewm(alpha=1/ventana, adjust=False).mean()
+    media_perdidas = perdidas.ewm(alpha=1/ventana, adjust=False).mean()
+    
     rs = media_ganancias / media_perdidas
     rsi = 100 - (100 / (1 + rs))
     return rsi
@@ -69,6 +70,9 @@ def analizar_etf(ticker="QQQ"):
     print(f"Evaluando {ticker} y leyendo noticias...")
     etf = yf.Ticker(ticker)
     hist = etf.history(period="1y")
+    if hist.empty:
+        print("Error: No se pudieron descargar los datos de Yahoo Finance. Reintentar más tarde.")
+        return
     
     hist['SMA_200'] = hist['Close'].rolling(window=200).mean()
     hist['RSI'] = calcular_rsi(hist)
@@ -80,15 +84,20 @@ def analizar_etf(ticker="QQQ"):
     # --- NUEVA LÓGICA DE SENTIMIENTO ---
     sentimiento_texto, sentimiento_valor = analizar_sentimiento_noticias(ticker)
     
-    estado = "Normal 🟡"
     # Ahora la oportunidad de compra es aún más fuerte si hay pánico en las noticias
-    if rsi_actual < 30 and precio_actual < sma_actual:
-        if sentimiento_valor <= -0.15:
+    if rsi_actual < 30:
+        # Entramos aquí solo con que el RSI sea bajo, garantizando que avise.
+        if precio_actual < sma_actual and sentimiento_valor <= -0.15:
+            # Se alinearon los astros: RSI bajo, precio bajo la tendencia y pánico en noticias
             estado = "Oportunidad de Oro (Caída + Pánico) 🟢🟢"
         else:
+            # Caída fuerte a corto plazo, pero no necesariamente bajo la SMA o con pánico
             estado = "Barato (Oportunidad de compra) 🟢"
+
     elif rsi_actual > 70:
         estado = "Inflado (Sobrecomprado) 🔴"
+    else:
+        estado = "Normal ⚪"
         
     mensaje_final = (
         f"📊 *Resumen de Inversión: {ticker}*\n"

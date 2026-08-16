@@ -2,6 +2,7 @@ import yfinance as yf
 import pandas as pd
 import requests
 import os
+import math
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dotenv import load_dotenv
@@ -19,6 +20,10 @@ TIEMPO_ESPERA_HTTP = 15
 CAPITAL_INICIAL_BACKTEST = 10000.0
 COMISION_POR_OPERACION = 0.0005
 SLIPPAGE_POR_OPERACION = 0.0005
+PESO_TENDENCIA = 0.35
+PESO_MOMENTUM = 0.25
+PESO_RIESGO = 0.25
+PESO_SENTIMIENTO = 0.15
 
 
 def crear_sesion_http():
@@ -71,6 +76,142 @@ def calcular_rsi(datos, ventana=14):
     rs = media_ganancias / media_perdidas
     rsi = 100 - (100 / (1 + rs))
     return rsi
+
+
+def agregar_indicadores(hist):
+    """Calcula indicadores tecnicos y de dinamica de precio."""
+    datos = hist.copy()
+    datos["SMA_200"] = datos["Close"].rolling(window=200).mean()
+    datos["RSI"] = calcular_rsi(datos)
+
+    # Derivada discreta del precio en porcentaje diario.
+    datos["RET_DIA"] = datos["Close"].pct_change()
+    datos["DERIVADA_PRECIO_PCT"] = datos["RET_DIA"] * 100
+
+    # Segunda derivada discreta: aceleracion del retorno.
+    datos["ACELERACION_PCT"] = datos["DERIVADA_PRECIO_PCT"].diff()
+    datos["MOMENTUM_20D_PCT"] = (datos["Close"] / datos["Close"].shift(20) - 1.0) * 100
+    datos["VOL_20D_ANUAL_PCT"] = datos["RET_DIA"].rolling(20).std() * math.sqrt(252) * 100
+    datos["DISTANCIA_SMA200_PCT"] = ((datos["Close"] / datos["SMA_200"]) - 1.0) * 100
+
+    max_252 = datos["Close"].rolling(252).max()
+    min_252 = datos["Close"].rolling(252).min()
+    rango = (max_252 - min_252).replace(0, pd.NA)
+    datos["POS_RANGO_52S_PCT"] = ((datos["Close"] - min_252) / rango) * 100
+    return datos
+
+
+def calcular_metricas_precio(hist):
+    """Resume el estado de precio usando indicadores recientes."""
+    if hist.empty:
+        raise RuntimeError("No hay datos para calcular metricas de precio")
+
+    fila = hist.iloc[-1]
+    return {
+        "derivada_precio_pct": float(fila["DERIVADA_PRECIO_PCT"]),
+        "aceleracion_pct": float(fila["ACELERACION_PCT"]),
+        "momentum_20d_pct": float(fila["MOMENTUM_20D_PCT"]),
+        "vol_20d_anual_pct": float(fila["VOL_20D_ANUAL_PCT"]),
+        "distancia_sma200_pct": float(fila["DISTANCIA_SMA200_PCT"]),
+        "pos_rango_52s_pct": float(fila["POS_RANGO_52S_PCT"]),
+    }
+
+
+def limitar(valor, minimo=0.0, maximo=100.0):
+    return max(minimo, min(maximo, valor))
+
+
+def mapear_rango(valor, min_val, max_val):
+    if pd.isna(valor):
+        return 50.0
+    if max_val == min_val:
+        return 50.0
+    return limitar((valor - min_val) / (max_val - min_val) * 100.0)
+
+
+def categoria_score(score):
+    if score >= 75:
+        return "Alta"
+    if score >= 55:
+        return "Moderada"
+    if score >= 40:
+        return "Neutral"
+    return "Baja"
+
+
+def calcular_score_mercado(metricas_precio, sentimiento_valor, precio_actual, sma_actual, rsi_actual):
+    # Tendencia: privilegia precio sobre SMA200 y posicion alta en rango anual.
+    score_distancia = mapear_rango(metricas_precio["distancia_sma200_pct"], -15.0, 15.0)
+    score_rango = mapear_rango(metricas_precio["pos_rango_52s_pct"], 0.0, 100.0)
+    score_tendencia = (score_distancia * 0.6) + (score_rango * 0.4)
+
+    # Momentum: combina retorno de 20d y primera/segunda derivada.
+    score_momentum_20d = mapear_rango(metricas_precio["momentum_20d_pct"], -12.0, 12.0)
+    score_derivada = mapear_rango(metricas_precio["derivada_precio_pct"], -2.0, 2.0)
+    score_aceleracion = mapear_rango(metricas_precio["aceleracion_pct"], -1.5, 1.5)
+    score_momentum = (score_momentum_20d * 0.5) + (score_derivada * 0.3) + (score_aceleracion * 0.2)
+
+    # Riesgo: menor volatilidad y RSI en zona media suma puntaje.
+    score_volatilidad = 100.0 - mapear_rango(metricas_precio["vol_20d_anual_pct"], 10.0, 45.0)
+    distancia_rsi_ideal = abs(rsi_actual - 50.0)
+    score_rsi = 100.0 - mapear_rango(distancia_rsi_ideal, 0.0, 35.0)
+    score_riesgo = (score_volatilidad * 0.7) + (score_rsi * 0.3)
+
+    # Sentimiento: convierte compound (-1 a 1) en score 0-100.
+    score_sentimiento = mapear_rango(sentimiento_valor, -1.0, 1.0)
+
+    # Ajustes finos de coherencia de tendencia.
+    if precio_actual < sma_actual:
+        score_tendencia = score_tendencia * 0.9
+    if rsi_actual < RSI_BAJO:
+        score_riesgo = score_riesgo * 0.9
+    if rsi_actual > RSI_ALTO:
+        score_riesgo = score_riesgo * 0.85
+
+    score_total = (
+        score_tendencia * PESO_TENDENCIA
+        + score_momentum * PESO_MOMENTUM
+        + score_riesgo * PESO_RIESGO
+        + score_sentimiento * PESO_SENTIMIENTO
+    )
+    score_total = limitar(score_total)
+
+    return {
+        "score_total": float(score_total),
+        "categoria": categoria_score(score_total),
+        "score_tendencia": float(limitar(score_tendencia)),
+        "score_momentum": float(limitar(score_momentum)),
+        "score_riesgo": float(limitar(score_riesgo)),
+        "score_sentimiento": float(limitar(score_sentimiento)),
+    }
+
+
+def resumen_score_texto(score):
+    return (
+        "Score compuesto de entrada:\n"
+        f"- Senal total: {score['score_total']:.1f}/100 ({score['categoria']})\n"
+        f"- Tendencia: {score['score_tendencia']:.1f}\n"
+        f"- Momentum: {score['score_momentum']:.1f}\n"
+        f"- Riesgo: {score['score_riesgo']:.1f}\n"
+        f"- Sentimiento: {score['score_sentimiento']:.1f}"
+    )
+
+
+def resumen_metricas_precio_texto(metricas_precio):
+    def fmt(v, dec=2, suf=""):
+        if pd.isna(v):
+            return "N/D"
+        return f"{v:.{dec}f}{suf}"
+
+    return (
+        "Metricas avanzadas de precio:\n"
+        f"- Derivada diaria: {fmt(metricas_precio['derivada_precio_pct'], 3, '%')}\n"
+        f"- Aceleracion diaria: {fmt(metricas_precio['aceleracion_pct'], 3, ' pp')}\n"
+        f"- Momentum 20d: {fmt(metricas_precio['momentum_20d_pct'], 2, '%')}\n"
+        f"- Volatilidad 20d anualizada: {fmt(metricas_precio['vol_20d_anual_pct'], 2, '%')}\n"
+        f"- Distancia vs SMA200: {fmt(metricas_precio['distancia_sma200_pct'], 2, '%')}\n"
+        f"- Posicion en rango 52s: {fmt(metricas_precio['pos_rango_52s_pct'], 2, '%')}"
+    )
 
 def analizar_sentimiento_noticias(ticker="QQQ"):
     """Descarga titulares recientes y evalúa el nivel de pánico o euforia."""
@@ -140,10 +281,8 @@ def max_drawdown(serie_equity):
 
 def backtest_rapido(ticker="QQQ", period="10y"):
     hist = descargar_historial(ticker=ticker, period=period)
-    hist = hist.copy()
-    hist["SMA_200"] = hist["Close"].rolling(window=200).mean()
-    hist["RSI"] = calcular_rsi(hist)
-    hist = hist.dropna(subset=["SMA_200", "RSI"]).copy()
+    hist = agregar_indicadores(hist)
+    hist = hist.dropna(subset=["SMA_200", "RSI", "RET_DIA"]).copy()
 
     if hist.empty:
         raise RuntimeError("No hay suficientes datos para ejecutar backtest")
@@ -159,6 +298,8 @@ def backtest_rapido(ticker="QQQ", period="10y"):
     retorno_diario = []
     equity_previo = None
     capital_entrada = 0.0
+    ganancias = []
+    perdidas = []
 
     for fila in hist.itertuples():
         precio = float(fila.Close)
@@ -188,6 +329,9 @@ def backtest_rapido(ticker="QQQ", period="10y"):
             costo_slippage += acciones * (precio - precio_salida)
             if capital > capital_entrada:
                 operaciones_ganadoras += 1
+                ganancias.append(capital - capital_entrada)
+            else:
+                perdidas.append(capital_entrada - capital)
             acciones = 0.0
             en_posicion = False
 
@@ -208,6 +352,9 @@ def backtest_rapido(ticker="QQQ", period="10y"):
         costo_slippage += acciones * (precio_final - precio_salida)
         if capital > capital_entrada:
             operaciones_ganadoras += 1
+            ganancias.append(capital - capital_entrada)
+        else:
+            perdidas.append(capital_entrada - capital)
         acciones = 0.0
         en_posicion = False
         equity[-1] = capital
@@ -222,32 +369,51 @@ def backtest_rapido(ticker="QQQ", period="10y"):
     cagr = ((valor_final / CAPITAL_INICIAL_BACKTEST) ** (1 / anos) - 1) if anos > 0 else 0.0
 
     if retorno_diario:
-        media = pd.Series(retorno_diario).mean()
-        std = pd.Series(retorno_diario).std()
+        serie_ret = pd.Series(retorno_diario)
+        media = serie_ret.mean()
+        std = serie_ret.std()
         sharpe = (media / std) * (252 ** 0.5) if std and std > 0 else 0.0
+
+        downside = serie_ret[serie_ret < 0]
+        downside_std = downside.std()
+        sortino = (media / downside_std) * (252 ** 0.5) if downside_std and downside_std > 0 else 0.0
     else:
         sharpe = 0.0
+        sortino = 0.0
 
     dd_max = max_drawdown(equity)
     tasa_acierto = (operaciones_ganadoras / operaciones) if operaciones > 0 else 0.0
+    calmar = (cagr / abs(dd_max)) if dd_max < 0 else 0.0
+    total_ganancias = sum(ganancias)
+    total_perdidas = sum(perdidas)
+    if total_perdidas > 0:
+        profit_factor = total_ganancias / total_perdidas
+    elif total_ganancias > 0:
+        profit_factor = float("inf")
+    else:
+        profit_factor = 0.0
 
     return {
-        "valor_final": valor_final,
-        "buy_hold_final": buy_hold_final,
-        "retorno_pct": (valor_final / CAPITAL_INICIAL_BACKTEST - 1.0) * 100,
-        "buy_hold_retorno_pct": (buy_hold_final / CAPITAL_INICIAL_BACKTEST - 1.0) * 100,
-        "cagr_pct": cagr * 100,
-        "sharpe": sharpe,
-        "max_drawdown_pct": dd_max * 100,
+        "valor_final": float(valor_final),
+        "buy_hold_final": float(buy_hold_final),
+        "retorno_pct": float((valor_final / CAPITAL_INICIAL_BACKTEST - 1.0) * 100),
+        "buy_hold_retorno_pct": float((buy_hold_final / CAPITAL_INICIAL_BACKTEST - 1.0) * 100),
+        "cagr_pct": float(cagr * 100),
+        "sharpe": float(sharpe),
+        "sortino": float(sortino),
+        "calmar": float(calmar),
+        "profit_factor": float(profit_factor),
+        "max_drawdown_pct": float(dd_max * 100),
         "operaciones": operaciones,
-        "tasa_acierto_pct": tasa_acierto * 100,
-        "comisiones_pagadas": comisiones_pagadas,
-        "costo_slippage": costo_slippage,
-        "costo_total_friccion": comisiones_pagadas + costo_slippage,
+        "tasa_acierto_pct": float(tasa_acierto * 100),
+        "comisiones_pagadas": float(comisiones_pagadas),
+        "costo_slippage": float(costo_slippage),
+        "costo_total_friccion": float(comisiones_pagadas + costo_slippage),
     }
 
 
 def resumen_backtest_texto(metricas):
+    pf = "inf" if math.isinf(metricas["profit_factor"]) else f"{metricas['profit_factor']:.2f}"
     return (
         "Backtest rapido (10y):\n"
         f"- Supuestos: comision {COMISION_POR_OPERACION * 100:.2f}% y slippage {SLIPPAGE_POR_OPERACION * 100:.2f}% por operacion\n"
@@ -255,6 +421,9 @@ def resumen_backtest_texto(metricas):
         f"- Buy and Hold: {metricas['buy_hold_retorno_pct']:.2f}%\n"
         f"- CAGR: {metricas['cagr_pct']:.2f}%\n"
         f"- Sharpe: {metricas['sharpe']:.2f}\n"
+        f"- Sortino: {metricas['sortino']:.2f}\n"
+        f"- Calmar: {metricas['calmar']:.2f}\n"
+        f"- Profit Factor: {pf}\n"
         f"- Max Drawdown: {metricas['max_drawdown_pct']:.2f}%\n"
         f"- Operaciones: {metricas['operaciones']}\n"
         f"- Tasa de acierto: {metricas['tasa_acierto_pct']:.2f}%\n"
@@ -275,12 +444,13 @@ def analizar_etf(ticker="QQQ"):
         print("Error: No se pudieron descargar los datos de Yahoo Finance. Reintentar más tarde.")
         return
     
-    hist['SMA_200'] = hist['Close'].rolling(window=200).mean()
-    hist['RSI'] = calcular_rsi(hist)
+    hist = agregar_indicadores(hist)
     
     precio_actual = hist['Close'].iloc[-1]
     sma_actual = hist['SMA_200'].iloc[-1]
     rsi_actual = hist['RSI'].iloc[-1]
+
+    metricas_precio = calcular_metricas_precio(hist)
 
     if pd.isna(sma_actual) or pd.isna(rsi_actual):
         print("Datos insuficientes para calcular SMA 200 o RSI.")
@@ -288,6 +458,13 @@ def analizar_etf(ticker="QQQ"):
     
     # --- NUEVA LÓGICA DE SENTIMIENTO ---
     sentimiento_texto, sentimiento_valor = analizar_sentimiento_noticias(ticker)
+    score = calcular_score_mercado(
+        metricas_precio=metricas_precio,
+        sentimiento_valor=sentimiento_valor,
+        precio_actual=float(precio_actual),
+        sma_actual=float(sma_actual),
+        rsi_actual=float(rsi_actual),
+    )
     
     # Ahora la oportunidad de compra es aún más fuerte si hay pánico en las noticias
     if rsi_actual < RSI_BAJO:
@@ -310,7 +487,9 @@ def analizar_etf(ticker="QQQ"):
         f"SMA 200 días: ${sma_actual:.2f}\n"
         f"RSI (14 días): {rsi_actual:.2f}\n"
         f"Sentimiento en Noticias: {sentimiento_texto}\n\n"
-        f"Estado del mercado: {estado}"
+        f"{resumen_score_texto(score)}\n\n"
+        f"Estado del mercado: {estado}\n\n"
+        f"{resumen_metricas_precio_texto(metricas_precio)}"
     )
 
     try:
